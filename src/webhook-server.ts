@@ -13,7 +13,7 @@ import type { Chat } from 'chat';
 
 import { log } from './log.js';
 
-const DEFAULT_PORT = 3000;
+const DEFAULT_PORT = 1996;
 
 interface WebhookEntry {
   chat: Chat;

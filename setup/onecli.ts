@@ -106,7 +106,7 @@ function writeEnvOnecliUrl(url: string): void {
 // and the redirect-based version probe fail. Bump deliberately when a
 // new CLI release ships.
 const ONECLI_GATEWAY_VERSION = '1.23.0';
-const ONECLI_CLI_FALLBACK_VERSION = '1.3.0';
+const ONECLI_CLI_FALLBACK_VERSION = '1.6.0';
 const ONECLI_CLI_REPO = 'onecli/onecli-cli';
 
 function installOnecliCliOnly(): { stdout: string; ok: boolean } {
@@ -147,6 +147,29 @@ function removeLegacyOnecliContainers(): string {
   return out.join('\n');
 }
 
+/**
+ * Docker Compose <2.24 rejects the extended env_file object syntax
+ * (path + required) that OneCLI's installer generates. Since the entry is
+ * always `required: false` (pointing at ~/.env which may not exist), it's
+ * safe to drop it entirely.
+ */
+function patchComposeEnvFile(composePath: string): boolean {
+  if (!fs.existsSync(composePath)) return false;
+  const original = fs.readFileSync(composePath, 'utf-8');
+  // Remove any env_file block whose only entries are optional (required: false).
+  // The block looks like (4-space indent for service, 6 for list, 8 for keys):
+  //     env_file:
+  //       - path: ../.env
+  //         required: false
+  const patched = original.replace(
+    /^( {4})env_file:\n(?:\1 {2}- path:[^\n]+\n\1 {4}required: false\n)+/gm,
+    '',
+  );
+  if (patched === original) return false;
+  fs.writeFileSync(composePath, patched);
+  return true;
+}
+
 function installOnecli(): { stdout: string; ok: boolean } {
   let stdout = '';
 
@@ -157,6 +180,36 @@ function installOnecli(): { stdout: string; ok: boolean } {
   const gw = runInstall(`export ONECLI_VERSION=${ONECLI_GATEWAY_VERSION} && curl -fsSL onecli.sh/install | sh`);
   stdout += gw.stdout;
   if (!gw.ok) {
+    // Docker Compose <2.24 rejects the extended env_file object syntax the
+    // installer generates. Patch the file and bring up the stack ourselves.
+    const composePath = path.join(os.homedir(), '.onecli', 'docker-compose.yml');
+    const isEnvFileSyntaxError =
+      gw.stderr?.includes('must be a string') || gw.stderr?.includes('env_file');
+    if (isEnvFileSyntaxError && patchComposeEnvFile(composePath)) {
+      log.warn(
+        'Docker Compose rejected extended env_file syntax — patched compose file for compatibility',
+      );
+      const composeFile = JSON.stringify(composePath);
+      const recover = runInstall(
+        `docker compose -f ${composeFile} pull && docker compose -f ${composeFile} up -d`,
+      );
+      stdout += recover.stdout;
+      if (recover.ok) {
+        log.info('OneCLI gateway started via patched compose file');
+        // fall through to CLI install below
+        const upstream = runInstall('curl -fsSL onecli.sh/cli/install | sh');
+        stdout += upstream.stdout;
+        if (upstream.ok) return { stdout, ok: true };
+        log.warn('Upstream CLI installer failed — falling back to direct download', {
+          stderr: upstream.stderr,
+        });
+        stdout += (upstream.stderr ?? '') + '\n';
+        const fallback = installOnecliCliDirect();
+        stdout += fallback.stdout;
+        return { stdout, ok: fallback.ok };
+      }
+      stdout += recover.stderr ?? '';
+    }
     log.error('OneCLI gateway install failed', { stderr: gw.stderr });
     return { stdout: stdout + (gw.stderr ?? ''), ok: false };
   }
